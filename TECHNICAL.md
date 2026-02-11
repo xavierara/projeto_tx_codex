@@ -2,14 +2,15 @@
 
 This repository implements a **model-based reinforcement learning pipeline** for dynamic pricing of used-car listings. The system extracts empirical transition probabilities from real price trajectories and trains a tabular Q-learning agent in a simulated environment to optimize pricing decisions, maximizing expected revenue while accounting for holding costs.
 
-**Main Notebook**: [rl_pricing_model_based_id.ipynb](rl_pricing_model_based_id.ipynb) — Recommended for production use (clean train/validation split, no data leakage)
+**Main Notebook**: [pricing_rl.ipynb](pricing_rl.ipynb)
 
 ## Overview
 
-The pipeline operates in two phases:
+The pipeline operates in three phases:
 
-1. **Offline Learning Phase**: Build predictive models (price & hazard) from historical data, then train an RL agent in a simulated environment
+1. **Offline Learning Phase**: Build price prediction model from historical data, extract empirical transitions from real price trajectories, then train an RL agent in a simulated environment
 2. **Deployment Phase**: Use the learned Q-table to recommend prices for new listings
+3. **Online Learning (Optional)**: Continuously refine the policy with live feedback from actual sales and market dynamics
 
 ---
 
@@ -24,10 +25,12 @@ The pipeline operates in two phases:
 - Parse datetime columns: `dateCreated`, `dateCrawled`, `lastSeen`
 - Drop records with missing dates
 - Calculate listing duration: `duration_days = (lastSeen - dateCreated)`
+- Create `ad_id`: composite key (`brand|model|year|km|gearbox|color|seller`) to identify repeated listings of the same car
 - Translate German categorical values to English (e.g., `Benzin` → `Petrol`)
-- Filter extreme outliers (e.g., prices > 99th percentile)
+- Filter extreme outliers (prices > 99th percentile, mileage > 99th percentile, power PS, year range)
+- Create derived features: `age_years`, `log_km`, `log_power`, `month_created`
 
-**Output**: Clean DataFrame with temporal features and standardized labels
+**Output**: Clean DataFrame with temporal features, standardized labels, and ad-tracking alongside price trajectory identification
 
 ---
 
@@ -37,16 +40,18 @@ The pipeline operates in two phases:
 
 **Strategy**:
 ```
-Segment = (Brand, Model, Vehicle Type, Year Bin)
+Segment = (Brand, Model_slim, Vehicle Type, Year Bin)
 ```
 
 **Details**:
 - Extract brand-model pairs; keep only those with ≥200 listings (`MIN_MODEL_COUNT`)
+- For rare brand-model pairs, collapse model to `"other"`
 - Vehicle type: `Sedan`, `SUV`, `Estate`, `Coupe`, `Convertible`, `Van`, `City Car`, `Off-road`, `Pickup`
-- Year bins: 5-year ranges (e.g., 2020–2024, 2015–2019)
-- Assign each listing a `segment_id`
+- Year bins: 3-year ranges (e.g., `2021–2023`, `2018–2020`)
+- Assign each listing a `seg` (string composite key)
+- **Fallback**: If segment count > 2000, use lighter grouping: `(Brand, Vehicle Type, Year Bin)`
 
-**Rationale**: Ensures sufficient data per segment for reliable empirical transition estimates
+**Rationale**: Ensures sufficient data per segment for reliable empirical transition estimates while avoiding over-segmentation
 
 ---
 
@@ -54,11 +59,13 @@ Segment = (Brand, Model, Vehicle Type, Year Bin)
 
 **Purpose**: Predict fair-market price for a car given its features
 
+**Data Split**: 80% train / 20% validation (temporal split on `dateCreated`)
+
 **Model**: LightGBM regressor on log-transformed prices
 
 **Features**:
-- Numerical: `mileageKm`, `powerPS`, `year`, `monthOfRegistration`
-- Categorical: `gearbox`, `fuelType`, `seller`
+- Numerical: `age_years`, `log_km`, `log_power`, `month_created`
+- Categorical: `brand`, `vehicleType`, `gearbox`, `fuelType`, `notRepairedDamage`, `seller`, `model_slim` (if < 300 unique values)
 
 **Training**:
 ```python
@@ -70,67 +77,55 @@ lgb.LGBMRegressor(
     learning_rate=0.05,
     num_leaves=64,
     subsample=0.8,
-    colsample_bytree=0.8
+    colsample_bytree=0.8,
+    random_state=42
 ).fit(X_train, y_train)
 ```
 
-**Output**: Function $p_0(x)$ that predicts baseline price in €
+**Output**: Function $p_0(x)$ that predicts baseline price in €; validation RMSLE reported
 
-**Usage**: Represents the "fair" price; deviations from $p_0$ are encoded as state delta $\Delta$
+**Usage**: Represents the "fair" price; deviations from $p_0$ are encoded as state delta $\Delta = \log(\text{price} / p_0(x))$
 
----
+### 4. Empirical Transition Table
 
-### 4. Ad-ID Construction
+**Purpose**: Learn empirical sale probabilities $P(\text{sale} \mid \text{segment}, \text{week}, \text{action})$ from real data
 
-**Purpose**: Identify repeated listings of the same car across multiple weekly crawls
-
-**Method**: Composite key
-```
-ad_id = (mileageKm, brand, model, year, powerPS, gearbox, fuelType, seller)
-```
-
-**Why**: Enables extraction of real price trajectories (how sellers reprice over time)
-
-**Output**: `df_sorted` with ads grouped by ID and sorted by `dateCrawled`
-
----
-
-### 5. Empirical Transition Table
-
-**Purpose**: Learn empirical probabilities $P(\text{sale} \mid \text{segment}, \text{week}, \text{action})$ from real data
-
-**Data Source**: **Training set only** (no data leakage into evaluation)
+**Data Source**: **Training set only** (80% split, no data leakage into evaluation)
 
 **Process**:
 
-1. **Extract trajectories**: For each ad-id, collect price sequence across weeks
+1. **Extract trajectories**: For each ad-id with ≥2 observations, collect price sequence across crawls
    ```
-   Trajectory: w1 → w2 → w3 → ... → sold/disappeared
+   Trajectory: observation₁ → observation₂ → ... → last observation (assumed sold/delisted)
    ```
 
-2. **Compute price deltas**: For each transition
+2. **Compute price changes & actions**: For each transition within a trajectory
    ```
-   Δ = log(price_t) - log(p0(x))
-   action_bin = argmin_a |price_t - p0(x) * exp(ACTION_PCTS[a])|
+   price_change_pct = (price_t+1 - price_t) / price_t
+   → Bin into action categories: "drop_5%", "drop_3%", "hold", "raise_3%", "raise_5%"
    ```
 
 3. **Aggregate events**:
    ```
-   For each (segment_id, week_t, action_bin):
-       P(sale | seg, t, a) = [# sales in next week] / [# listings]
+   For each (segment, week_position, action_bin):
+       P(sale | seg, t, a) = [# times followed by next observation] / [# total times seen]
    ```
 
 4. **Result**: DataFrame with columns:
-   - `seg`: segment ID
-   - `t_week`: week (1–12)
-   - `action_bin`: action index (0–4 for 5 actions)
-   - `sold_next_obs`: empirical sale probability
+   - `seg`: segment identifier (string)
+   - `t_week`: week position (1–12)
+   - `action_bin`: action category (one of 5 price adjustment buckets)
+   - `p_sale`: empirical sale probability (0–1)
+   - `n_total`: sample count per (seg, t, a) triplet
+   - Supporting stats: `avg_price_change`, `std_price_change`
 
-**Key Property**: Clean train/valid split ensures unbiased evaluation
+**Key Property**: Clean train/validation split ensures unbiased evaluation; real seller behavior grounds the transition model
 
 ---
 
 
+
+---
 
 ## Reinforcement Learning Framework
 
@@ -140,9 +135,9 @@ The RL agent learns a **policy** $\pi(s) \rightarrow a$ that maps states to pric
 
 | Component | Description | Values |
 |-----------|-------------|--------|
-| `seg_id` | Segment ID | 1–200+ |
+| `seg_id` | Segment ID (hash of segment string) | 0 to ~200+ |
 | `t` | Weeks in listing | 1–12 |
-| `delta_bucket` | Price deviation bin | 16 bins in $[-0.5, 0.5]$ |
+| `delta_bucket` | Price deviation bin | 16 bins spanning $[-0.5, 0.5]$ |
 
 **Discretization**: Delta is binned into 16 equal intervals; e.g., $\Delta \in [-0.03, 0)$ maps to bucket 5.
 
@@ -165,7 +160,7 @@ Five discrete price adjustments:
 **Mathematical Form**:
 ```
 action_pct ∈ ACTION_PCTS = [-0.05, -0.03, 0.0, +0.03, +0.05]
-new_price = p0(x) * exp(delta + action_pct)
+new_price = p0(x) * exp(delta + log(1 + action_pct))
 ```
 
 ---
@@ -193,39 +188,49 @@ where $\gamma = 0.98$ (discount factor).
 
 ---
 
-### RL Environment: CarPricingEnv
+### 5. Implement RL Environment
+
+**Class**: `CarPricingEnv`
 
 **Dynamics** (each step):
 
-1. **Current state**: $(x, t, \Delta)$
-2. **Agent chooses action**: $a \sim \pi(s)$
+1. **Current state**: $(x, t, \Delta)$ where:
+   - $x$ = car features (segment, p0-value)
+   - $t$ = weeks since listing
+   - $\Delta$ = log-price deviation from p0
+
+2. **Agent chooses action**: $a \in \{0, 1, 2, 3, 4\}$ corresponding to `ACTION_PCTS = [-5%, -3%, 0%, +3%, +5%]`
+
 3. **Update price**:
    ```
-   Δ_new = clip(Δ + ACTION_PCTS[a])
-   price_new = p0(x) * exp(Δ_new)
+   Δ_new = Δ + log(1 + ACTION_PCTS[a])
+   Δ_new = clip(Δ_new, δmin_seg, δmax_seg)  # Segment-specific bounds
+   price_new = p0 * exp(Δ_new)
    ```
+
 4. **Sample sale event** (from empirical transitions):
    ```
-   p_sale = P(sale | segment, week, action)  [from real data]
+   p_sale = P(sale | segment, t, action)  [from real data table]
    sale ← Bernoulli(p_sale)
    ```
+
 5. **Transition**:
-   - **If sale**: $r = \text{price\_new}$, $\text{done} = \text{True}$
-   - **Else**: $r = -\text{HOLDING\_COST}$, transition to $(x, t+1, \Delta_\text{new})$
+   - **If sale**: reward $r = \text{price\_new}$, done = True
+   - **Else**: reward $r = -\text{HOLDING\_COST}$ (€40/week), $t \to t+1$, continue
 
-**Termination**: Episode ends when sale occurs or $t > \text{TMAX} = 12$ weeks.
+**Termination**: Episode ends when sale occurs or $t > \text{TMAX} = 12$ weeks
 
-**Key Property**: Sale probabilities are grounded in **observed seller behavior**, not ML predictions, ensuring realistic training dynamics.
+**Key Property**: Sale probabilities are grounded in **observed seller behavior** from empirical transitions, ensuring realistic training dynamics without synthetic ML predictions
 
 ---
 
-### Q-Learning: Policy Training
+### 6. Q-Learning: Policy Training
 
 **Algorithm**: Tabular Q-learning with ε-greedy exploration
 
-**Q-Table**: Maps states to action values
+**Q-Table**: Maps states to action values (defaultdict initialized to zeros)
 ```python
-Q[(seg_id, t, delta_bucket)] = [Q_a0, Q_a1, Q_a2, Q_a3, Q_a4]
+Q[(seg_id, t, delta_bucket)] = [Q_0, Q_1, Q_2, Q_3, Q_4]  # 5 action values per state
 ```
 
 **Update Rule** (Bellman temporal-difference):
@@ -242,6 +247,7 @@ where:
 ```python
 for episode in range(N_EPISODES):
     s = env.reset()
+    total_reward = 0.0
     for step in range(TMAX):
         # Epsilon-greedy action selection
         if random() < eps:
@@ -250,17 +256,21 @@ for episode in range(N_EPISODES):
             a = argmax_a Q(s, a)  # Exploitation
         
         # Environment step
-        s_next, r, done = env.step(a)
+        s_next, r, done, info = env.step(a)
         
         # Q-learning update
-        Q[s][a] += ALPHA * (r + (0.0 if done else GAMMA * max(Q[s_next])) - Q[s][a])
+        Q[s][a] += ALPHA * (r + (0.0 if done else GAMMA * np.max(Q[s_next])) - Q[s][a])
         
+        total_reward += r
         s = s_next
         if done:
             break
     
     # Decay exploration
     eps = max(EPS_END, eps * EPS_DECAY)
+    
+    # Track episode return
+    ep_returns.append(total_reward)
 ```
 
 **Exploration Schedule**:
@@ -268,35 +278,129 @@ for episode in range(N_EPISODES):
 - **Final** ($\text{eps} = 0.05$): 95% greedy, 5% random (refine policy)
 - **Decay**: $\text{eps} \leftarrow 0.995 \times \text{eps}$ each episode
 
+**Output**: Trained Q-table with learned values for visited state-action pairs; rolling average of episode returns monitored
+
 ---
 
-### Learned Policy: Deployment
+---
+
+### 7. Baselines + Evaluation
+
+**Baseline Policies**:
+
+1. **Keep Price** (`baseline_keep_price`): Always select "hold price" action (index 2); never adjust price
+2. **RL Q-Learning** (`rl_policy`): Greedy action selection from learned Q-table
+
+**Evaluation Metrics** (over $N_{\text{eval}} = 1000$ episodes):
+
+- **Mean episode return**: Average cumulative reward (revenue - holding costs)
+- **Sale rate**: Fraction of episodes that end in sale (non-timeout)
+- **Average weeks to sale**: Mean episode length for sold listings
+- **Average price ratio** (conditional on sale): Mean final price / p0 for episodes that sold
+- **Survival curves**: Probability of remaining unsold at each week $t = 1, \ldots, 12$
+
+**Learned Policy: Deployment**
 
 After training, the policy is deterministic (greedy):
 
-$$\pi(s) = \arg\max_a Q(s, a)$$
+$$\pi^*(s) = \arg\max_a Q(s, a)$$
 
-**Usage**: For a new listing with segment `seg_id` at week `t` with price delta `Δ`:
+**Usage**: For a new listing with segment `seg` at week `t` with price delta $\Delta$:
 1. Discretize: $\Delta \rightarrow \text{delta\_bucket}$
-2. Look up: $Q[\text{seg\_id}, t, \text{delta\_bucket}]$
-3. Select: $a^* = \arg\max Q[s]$
-4. Execute: Adjust price by `ACTION_PCTS[a*]`
+2. Map segment: `seg` → `seg_id`
+3. Look up: $Q[\text{seg\_id}, t, \text{delta\_bucket}]$
+4. Select: $a^* = \arg\max Q[s]$
+5. Execute: Adjust price by `ACTION_PCTS[a*]`
 
 ---
 
-## Evaluation
+### 8. Online Learning (Interactive Simulation)
 
-### Baseline
+**Concept**: Simulate a scenario where the agent receives live feedback from successful sales during list adjustment and updates its policy online (continuously learning).
 
-1. **Keep Price** (`keep_price`): Never adjust; hold at $p_0(x)$
+**Setup**:
+- Start with the pre-trained Q-table from section 6
+- Simulate $N$ interactive episodes
+- After each sale, log the actual transaction price and conditions
+- Apply Q-learning updates to reflect the observed outcome
+- Decay exploration rate as episodes progress
 
-### Metrics
+**Output**:
+- Convergence curves showing online refinement
+- Action distribution during adaptive learning
+- Comparison of online-learned policy vs. offline-trained baseline
 
-- **Mean reward per episode**: Average revenue minus holding costs
-- **Sale rate**: Fraction of episodes that end in sale (vs. timeout)
-- **Survival curves**: Probability of still unsold at week $t$
-- **Segment breakdown**: Per-segment average reward
-- **Sensitivity analysis**: Robustness to changes in holding cost, discount factor
+---
+
+### 9. Diagnostics and Analysis
+
+Comprehensive diagnostics to validate model quality, RL convergence, and policy robustness:
+
+**9.1 — Model Quality Diagnostics**
+- Price-model residual analysis: histogram, QQ-plot, predicted vs. actual scatter
+- Residual statistics: mean, std, skewness, kurtosis
+- Identifies potential model misspecification or outlier sensitivity
+
+**9.2 — Policy Robustness & Sensitivity**
+- Sweep holding cost: $\{5, 10, 20, 50, 100\}$ €/week
+- Compare average returns: RL policy vs. keep-price baseline
+- Identifies which cost regime favors discounting vs. patience
+
+**9.3 — Segment-Level Performance**
+- Per-segment average returns for both policies
+- Identifies segments where RL significantly outperforms or underperforms
+- Reveals whether discounting is uniformly beneficial or segment-dependent
+
+**9.4 — Price Action Distribution**
+- Overall action frequency (%) for RL policy vs. baselines
+- RL action mix by week: shows how strategy evolves over list lifetime
+- Validates that policy exhibits sensible progression (e.g., higher discounts as time progresses)
+
+**9.5 — Hazard Reliability Diagram**
+- Bin predicted sale probabilities into deciles
+- Compare predicted vs. observed event rates in simulation
+- Validates that empirical transitions are well-calibrated
+
+**9.6 — Q-Value Heatmaps & Greedy Action Maps**
+- Value function $V^*(t, \Delta)$ for most-visited segment
+- Greedy action $\pi^*(t, \Delta)$ showing pricing strategy over state space
+- Q-table coverage: % of reachable states explored during training
+
+**9.7 — Out-of-Distribution (OOD) Detection**
+- Track which states during evaluation were never visited during training
+- OOD rate by week and delta bucket
+- Flags potential model extrapolation risks
+
+**9.8 — Q-Learning Convergence & Stability**
+- Rolling mean ± 1 std of episode returns
+- Distribution of returns: first 20% episodes vs. last 20% episodes
+- Epsilon decay schedule
+- Q-value distribution: shows range and spread of learned estimates
+- Convergence stats: improvement from early to late training
+
+---
+
+### 10. Exploratory Examples
+
+Detailed walkthroughs and examples of pipeline outputs for interpretability:
+
+**10.1 — Segment Composition Examples**
+- Top segments by listing count
+- Characteristics: brand, model, vehicle type, year range, price stats
+- Distribution across gearbox/fuel types
+- Validates that segments capture meaningful car categories
+
+**10.2 — Price Prediction Examples**
+- Sample 10 random cars with actual vs. predicted prices
+- Prediction statistics: MAE, MEDIAN AE, RMSLE, delta distribution
+- Per-segment prediction accuracy breakdown
+- Identifies which segments are easier/harder to price
+
+**10.3 — Agent Policy Walkthrough**
+- Simulate same demo cars through both policies ("keep price" vs. RL)
+- Show week-by-week breakdown: action taken, event probability, outcome
+- Compare cumulative returns and final price ratios
+- Demonstrates policy differences and RL advantage/disadvantage by scenario
 
 ---
 
@@ -341,26 +445,6 @@ All key parameters are defined in **Cell 0** of the notebook:
 
 ---
 
-## Notebook Structure
-
-The main notebook is organized into 10 major sections:
-
-| Section | Title | Purpose |
-|---------|-------|---------|
-| 0 | Config + Imports | Hyperparameters and dependencies |
-| 1 | Load + Clean Data | Parse and preprocess `autos.csv` |
-| 2 | Safe Grouping Strategy | Create homogeneous car segments |
-| 3 | Baseline Price Model | Train $p_0(x)$ LightGBM regressor |
-| 1.5 | Build Ad-ID | Identify repeated listings |
-| 4 | Empirical Transitions | Extract $P(\text{sale} \mid \text{segment}, \text{week}, \text{action})$ from real data |
-| 5 | RL Environment | Implement `CarPricingEnv` dynamics |
-| 6 | Train RL Agent | Run Q-learning for 10k episodes |
-| 7 | Baselines + Evaluation | Compare agent vs. baselines |
-| 7.5 | Offline Evaluation | Compare to real seller behavior |
-| 8–9 | Extended Diagnostics | Price model residuals, OOD detection, Q-value heatmaps, convergence analysis |
-
----
-
 ## Key Technical Insights
 
 ### Why Model-Based RL with Empirical Transitions?
@@ -391,23 +475,12 @@ For larger state spaces or continuous actions, deep RL (DQN, PPO) would be more 
 
 ```
 projeto_tx_codex/
-├── README.md                          # This file
-├── config.yaml                        # (Optional) External config
-├── data/
-│   └── autos.csv                      # German used-car dataset
-├── rl_pricing_model_based_id.ipynb    # Main notebook (recommended)
-├── rl_pricing_model_based_id_DP.ipynb # Variant (full-data transitions)
-├── rl_pricing_model_based.ipynb       # Older version
-├── notebooks/
-│   └── rl_pipeline_simple.ipynb       # Simplified pipeline
-├── data_utils.py                      # Data loading/processing helpers
-├── env.py                             # CarPricingEnv implementation
-├── evaluate.py                        # Evaluation utilities
-├── hazard_utils.py                    # Hazard model helpers
-├── plan_policy.py                     # Policy deployment utilities
-├── train_hazard_model.py              # Standalone hazard model script
-├── train_price_model.py               # Standalone price model script
-└── tests/
+├── README.md                          # Project overview
+├── TECHNICAL.md                       # This file (technical documentation)
+├── DESIGN_DECISIONS.md                # Design rationale and decisions
+├── pricing_rl.ipynb                   # Main notebook (all-in-one pipeline)
+└── data/
+    └── autos.csv                      # German used-car dataset
 
 ```
 
@@ -426,9 +499,11 @@ pip install lightgbm scikit-learn
 
 ### Issue: Q-values not converging (remain near zero)
 **Solution**: 
-- Check hazard model calibration (should output probabilities ≈ 0.05–0.30)
-- Verify empirical transitions exist for your segment
+- Check empirical transitions: verify that sale probabilities are reasonable (typically 0.05–0.30)
+- Ensure the training set has sufficient price trajectories per segment
+- Verify that `HOLDING_COST` is in a sensible range relative to typical car prices
 - Increase `N_EPISODES` or decrease `EPS_DECAY` for more exploration
+- Check that price changes are being correctly binned into the 5 action categories
 
 ### Issue: Segment counts too small
 **Solution**: Increase `MIN_MODEL_COUNT` to include more rare models, or decrease it if you want finer-grained segmentation.
