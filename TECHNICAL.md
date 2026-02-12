@@ -445,6 +445,87 @@ All key parameters are defined in **Cell 0** of the notebook:
 
 ---
 
+## Q-Learning Policy Model: Inputs and Outputs
+
+### Q-Learning Policy Model
+
+**Purpose**: Learn optimal pricing actions to maximize expected revenue per listing
+
+**Model Type**: Tabular Q-learning (state-action value function)
+
+**State Space Definition**:
+
+Each state $s$ is a tuple: $(s_{\text{seg}}, t, \Delta_{\text{bucket}})$
+
+| Component | Description | Cardinality | Example |
+|-----------|-------------|-------------|---------|
+| `seg_id` | Vehicle segment identifier (hash) | ~1,200 | 42 (VW Golf, Sedan, 2018-2020) |
+| `t` | Week since listing creation | 12 | 1, 5, 12 |
+| `delta_bucket` | Discretized price deviation bin | 16 | Bin 7 (delta ∈ [-0.03, 0.0]) |
+
+**Total state space**: ~1,200 × 12 × 16 ≈ **230,000 possible states**
+
+**State Construction**:
+1. **Segment mapping**: `seg = (brand, model_slim, vehicleType, year_bin)` → hash to integer ID
+2. **Week counting**: `t = ceil((current_date - dateCreated).days / 7)`, clipped to [1, 12]
+3. **Delta binning**: `delta = log(price / p0)` → discretize into 16 equal bins spanning [-0.5, 0.5]
+
+**Action Space**:
+
+Five discrete price adjustment actions:
+
+| Action Index | Adjustment | Description | Effect on Price |
+|-------------|-----------|-------------|-----------------|
+| 0 | -5% | Aggressive discount | `new_price = price × 0.95` |
+| 1 | -3% | Moderate discount | `new_price = price × 0.97` |
+| 2 | 0% | Hold price | `new_price = price` |
+| 3 | +3% | Small increase | `new_price = price × 1.03` |
+| 4 | +5% | Aggressive increase | `new_price = price × 1.05` |
+
+**Q-Table Structure**:
+```python
+Q: Dict[(seg_id, t, delta_bucket)] → Array[5]
+# Maps each state to 5 Q-values (one per action)
+# Example: Q[(42, 3, 7)] = [2450.0, 2680.0, 2590.0, 2310.0, 2180.0]
+#          → Action 1 (−3%) has highest value in this state
+```
+
+**Output**:
+- **During training**: Q-value updates via Bellman equation
+- **During deployment**: Greedy policy $\pi^*(s) = \arg\max_a Q(s, a)$ returns optimal action index
+
+**Training Algorithm** (Q-learning):
+
+**Input**: Environment with empirical transitions, initial Q-table (zeros)
+
+**Process** (10,000 episodes):
+1. Reset environment → initial state $s_0$
+2. For each timestep until episode ends:
+   - Select action: $a = \begin{cases} \text{random} & \text{with probability } \epsilon \\ \arg\max_a Q(s,a) & \text{otherwise} \end{cases}$
+   - Execute action → observe reward $r$, next state $s'$, done flag
+   - Update Q-value: $Q(s,a) \leftarrow Q(s,a) + \alpha [r + \gamma \max_{a'} Q(s',a') - Q(s,a)]$
+   - Decay exploration: $\epsilon \leftarrow \max(\epsilon_{\text{end}}, \epsilon \times \epsilon_{\text{decay}})$
+3. Log episode return for convergence monitoring
+
+**Output**: Trained Q-table with values for ~10k visited states
+
+**Deployment Usage**:
+```python
+# For a listing with features x at week t with current price p:
+seg_id = get_segment_id(x)
+delta = log(p / p0(x))
+delta_bucket = discretize_delta(delta)
+state = (seg_id, t, delta_bucket)
+
+# Get optimal action
+action = argmax(Q[state])  # Greedy policy
+
+# Execute price adjustment
+new_price = p * (1 + ACTION_PCTS[action])
+```
+
+---
+
 ## Key Technical Insights
 
 ### Why Model-Based RL with Empirical Transitions?
