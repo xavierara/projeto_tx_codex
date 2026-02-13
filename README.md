@@ -109,7 +109,7 @@ All hyperparameters are in **Cell 1** of `pricing_rl.ipynb`:
   - Week number (1–12)
   - Price deviation bin (16 buckets)
 
-- **Action**: Discrete price adjustment from $\{-5\%, -3\%, 0\%, +3\%, +5\%\}$
+- **Action**: Discrete price adjustment from -5\%, -3\%, 0\%, +3\%, +5\%
 
 - **Reward**: 
   - Sale: receive actual selling price (€)

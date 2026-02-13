@@ -145,7 +145,7 @@ The RL agent learns a **policy** $\pi(s) \rightarrow a$ that maps states to pric
 
 ---
 
-### Action Space: $a \in \{0, 1, 2, 3, 4\}$
+### Action Space: $a \in {0, 1, 2, 3, 4}$
 
 Five discrete price adjustments:
 
@@ -199,7 +199,7 @@ where $\gamma = 0.98$ (discount factor).
    - $t$ = weeks since listing
    - $\Delta$ = log-price deviation from p0
 
-2. **Agent chooses action**: $a \in \{0, 1, 2, 3, 4\}$ corresponding to `ACTION_PCTS = [-5%, -3%, 0%, +3%, +5%]`
+2. **Agent chooses action**: $a \in {0, 1, 2, 3, 4}$ corresponding to `ACTION_PCTS = [-5%, -3%, 0%, +3%, +5%]`
 
 3. **Update price**:
    ```
@@ -342,7 +342,7 @@ Comprehensive diagnostics to validate model quality, RL convergence, and policy 
 - Identifies potential model misspecification or outlier sensitivity
 
 **9.2 — Policy Robustness & Sensitivity**
-- Sweep holding cost: $\{5, 10, 20, 50, 100\}$ €/week
+- Sweep holding cost: ${5, 10, 20, 50, 100}$ €/week
 - Compare average returns: RL policy vs. keep-price baseline
 - Identifies which cost regime favors discounting vs. patience
 
